@@ -4,66 +4,68 @@ on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    runs-on: windows-2022
+  build:
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Enable RDP - Protection ON
-        shell: powershell
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+        - name: Checkout Code
+      uses: actions/checkout@v4
 
-      - name: Create RDP User - Password in Code
-        shell: powershell
-        run: |
-          $password = "Tanger@2026!Win"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          }
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          Write-Host "User RDP Created"
+        - name: Setup RDP User - Admin - No UAC
+      shell: powershell
+      run: |
+        Write-Host "=== Starting RDP Setup ==="
 
-      - name: Install Tailscale
-        shell: powershell
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+        # 1. فعل RDP
+        Write-Host "Enabling Remote Desktop..."
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
-      - name: Connect Tailscale
-        shell: powershell
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTHKEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
+        # 2. حيد UAC نهائيا - ما يبقاش يطلب مودباس
+        Write-Host "Disabling UAC..."
+        reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableLUA /t REG_DWORD /d 0 /f
+        reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f
+        reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v PromptOnSecureDesktop /t REG_DWORD /d 0 /f
+        reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableInstallerDetection /t REG_DWORD /d 0 /f
 
-      - name: Keep Alive 6 Hours
-        shell: powershell
-        run: |
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: Tanger@2026!Win"
-          Write-Host "=================="
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active"
-              Start-Sleep -Seconds 300
-          }
+        # 3. صاوب حساب RDP
+        Write-Host "Creating RDP User..."
+        $Password = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+        New-LocalUser -Name "RDP" -Password $Password -FullName "RDP" -Description "RDP User"
+        
+        # 4. عطيه Admin - هادي هي اللي كانت ناقصة فـ القديم
+        Write-Host "Adding RDP to Administrators..."
+        Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+        Write-Host "=== RDP User Created - Admin - UAC Disabled ==="
+
+        - name: Install Tailscale
+      shell: powershell
+      run: |
+        Write-Host "Installing Tailscale..."
+        Invoke-WebRequest -Uri https://tailscale.com/download/windows -OutFile tailscale.msi
+        Start-Process msiexec.exe -Wait -ArgumentList '/i tailscale.msi /quiet /norestart'
+        Write-Host "Tailscale Installed"
+
+        - name: Connect Tailscale
+      shell: powershell
+      run: |
+        Write-Host "Connecting to Tailscale..."
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-rdp
+        Start-Sleep -Seconds 5
+        $IP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+        Write-Host "=========================================="
+        Write-Host "RDP ADDRESS: $IP"
+        Write-Host "USERNAME: RDP"
+        Write-Host "PASSWORD: Your Secret Password"
+        Write-Host "=========================================="
+
+        - name: Keep Alive - 6 Hours
+      shell: powershell
+      run: |
+        Write-Host "RDP IS READY - You can connect now"
+        Write-Host "UAC is Disabled - Install anything without password"
+        Start-Sleep -Seconds 21000
